@@ -1,12 +1,18 @@
 import logging
 from dataclasses import dataclass
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import DeepEPMode, get_int_env_var, load_json_config
+from sglang.srt.utils import DeepEPMode, get_int_env_var, load_json_config, is_npu
+
+_is_npu = is_npu()
+
+if _is_npu:
+    import torch_npu
 
 try:
     from deep_ep import Buffer, Config
@@ -719,3 +725,96 @@ class DeepEPDispatcher:
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
         self._stage = new_stage
+
+
+class NpuDeepEPDispatcher:
+    def __init__(
+            self,
+            group: torch.distributed.ProcessGroup,
+            router_topk: int,
+            permute_fusion: bool = False,
+            num_experts: int = None,
+            num_local_experts: int = None,
+            hidden_size: int = None,
+            params_dtype: torch.dtype = None,
+            deepep_mode: DeepEPMode = DeepEPMode.auto,
+            async_finish: bool = False,
+            return_recv_hook: bool = False,
+            **kwargs,
+    ):
+        self.experts_share_num_copy = 1
+        self.n_routed_experts_per_rank = num_local_experts
+        self.route_share_on_same_card = True
+
+        self.n_shared_experts = kwargs.get("n_shared_experts")
+        self.n_routed_experts = kwargs.get("n_routed_experts")
+        self.num_experts_per_tok = kwargs.get("num_experts_per_tok")
+        self.hidden_size = kwargs.get("hidden_size")
+        self.global_rank = get_tensor_model_parallel_rank()
+
+        self.experts_tp_size = 1
+        self.world_size = get_tensor_model_parallel_world_size()
+
+        self.group_name = group._get_backend(torch.device("npu")).get_hccl_comm_name(self.global_rank)
+
+        # self.dynamic_quant_mode = int(os.getenv("QUANT_MODE", "3"))
+        # self.compute_expert_conf()
+
+        if self.route_share_on_same_card:
+            self.shared_expert_rank_num = 0
+        else:
+            self.shared_expert_rank_num = self.n_shared_experts * self.experts_share_num_copy
+
+    def dispatch(self, *args, **kwargs) -> Tuple:
+        x = kwargs.get("hidden_states")
+        # batch_size, seq_len, h = x.shape
+        hidden_states = x.view(-1, x.shape[-1])
+        topk_ids = kwargs.get("topk_idx")
+        topk_ids = topk_ids.to(torch.int)
+
+        _kwargs = {
+            "x": hidden_states,
+            "expert_ids": topk_ids,  # [n*topk]
+            "expert_shard_type": 0,
+            "shared_expert_rank_num": self.shared_expert_rank_num,
+            "moe_expert_num": self.n_routed_experts,  # 256
+            "global_bs": 0,  # 0 默认（全部）； 可以设置所有token
+            "scales": None,  # 量化系数
+            "quant_mode": 0,  # 0: 非量化；1: 静态量化；2：动态量化 TODO
+            "group_ep": self.group_name,  # 与torch不一样，通过名字来获取
+            "ep_world_size": self.world_size // self.experts_tp_size,
+            "ep_rank_id": self.global_rank // self.experts_tp_size,
+            # "group_tp": self.group_name,
+            # "tp_world_size": self.experts_tp_size,
+            # "tp_rank_id": self.global_rank % self.experts_tp_size,
+        }
+        return torch_npu.npu_moe_distribute_dispatch(**_kwargs)[:6]
+
+    def combine(self, *args, **kwargs) -> Tuple:
+        x = kwargs.get("hidden_states")
+        # batch_size, seq_len, h = x.shape
+        topk_ids = kwargs.get("topk_ids")
+        expand_idx = kwargs.get("topk_idx")
+        topk_weights = kwargs.get("topk_weights")
+        ep_send_counts = kwargs.get("ep_send_counts")
+        tp_send_counts = kwargs.get("tp_send_counts")
+        _kwargs = {
+            "expand_x": x,
+            "expert_ids": topk_ids.to(torch.int),  # [n*topk]
+            "expand_idx": expand_idx,
+            "expert_scales": topk_weights.to(torch.float32),  # weight [n*topk]
+            "expert_shard_type": 0,
+            "shared_expert_rank_num": self.shared_expert_rank_num,
+            "moe_expert_num": self.n_routed_experts,
+            "global_bs": 0,  # 0 默认（全部）； 可以设置所有token
+            "ep_send_counts": ep_send_counts,  # dispatch的send_counts
+            "group_ep": self.group_name,  # 与torch不一样，通过名字来获取
+            "ep_world_size": self.world_size,
+            "ep_rank_id": self.global_rank // self.experts_tp_size,
+            # "tp_send_counts": tp_send_counts,
+            # "group_tp": self.group_name,
+            # "tp_world_size": self.experts_tp_size,
+            # "tp_rank_id": self.global_rank % self.experts_tp_size,
+        }
+        hidden_states = torch_npu.npu_moe_distribute_combine(*args, **_kwargs)
+        return hidden_states
