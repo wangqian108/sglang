@@ -102,15 +102,21 @@ from sglang.srt.utils import (
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
+    is_npu,
     is_hopper_with_cuda_12_3,
     is_no_spec_infer_or_topk_one,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
-    set_cuda_arch,
+    set_cuda_arch, get_compiler_backend,
 )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
+
+if _is_npu:
+    import torch_npu
+    from operator import attrgetter
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -292,9 +298,80 @@ class ModelRunner:
             self.cuda_graph_runner = None
             self.init_attention_backend()
 
+        if self.device == "npu":
+            self.cast_format()
+
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             self.model.set_eagle3_layers_to_capture()
+
+        # torch._dynamo.config.cache_size_limit = 1000
+        # self.model = torch.compile(self.model, dynamic=False, backend=get_compiler_backend(), fullgraph=True)
+
+    def cast_format(self):
+        def for_each_to_tranpose_nz(weights, enable_nz: bool, parent, layer_idx=""):
+            def to_transpose_nz(tensor, transpose_contiguous=False):
+                if transpose_contiguous:
+                    if tensor.ndim > 2:
+                        tensor.data = tensor.data.transpose(-2, -1).contiguous()
+                    else:
+                        tensor.data = tensor.data.transpose(0, 1).contiguous()
+                return torch_npu.npu_format_cast(tensor.data, 29)
+
+            prefix = "NZ" if enable_nz else "transpose"
+            for name in weights:
+                getter = attrgetter(name)
+                tensor = getter(parent)
+                # logging.info("Before %s; size: %s, dtype: %s", f"{prefix} layer{layer_idx}.{name}", tensor.size(), tensor.dtype)
+                if enable_nz:
+                    tensor.data = to_transpose_nz(tensor, True)
+                else:
+                    tensor.data = tensor.data.transpose(-2, -1).contiguous()  # todo,  if no contiguous, there will be transpose dynamic ops in the profiling
+                # logging.info("After %s; size: %s, dtype: %s", f"{prefix} layer{layer_idx}.{name}", getter(parent).size(), getter(parent).dtype)
+
+        enable_weight_nz = int(os.getenv("ENABLE_WEIGHT_NZ", "0")) > 0
+        only_prefill = os.getenv("PREFILL_OR_DECODE", "decode") == "prefill"
+        only_decode = not only_prefill
+        enable_weight_nz_bk = enable_weight_nz
+        enable_weight_nz = enable_weight_nz and only_decode
+
+
+        # TODO self.mtp_proj  gate_up_proj->merge_up_gate_proj w13_weight->group_1_3_weight
+        # weights = ["lm_head.weight"] + (["model.mtp_proj.weight"] if self.server_args.speculative_algorithm == "NEXTN" else [])
+        # for_each_to_tranpose_nz(weights, enable_weight_nz, self.model)
+
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            if only_decode:
+                weights = ["weight_qa", "weight_kva", "weight_qb"]
+            else:
+                weights = ["self_attn.kv_b_proj.weight"]
+            if self.model_config.hf_config.q_lora_rank is not None:
+                weights += ["self_attn.q_a_proj.weight", "self_attn.q_b_proj.weight",
+                            "self_attn.kv_a_proj_with_mqa.weight", "self_attn.o_proj.weight"]
+                for_each_to_tranpose_nz(weights, enable_weight_nz, layer, layer_idx)
+
+            if layer_idx < self.model_config.hf_config.first_k_dense_replace:
+                weights = ["mlp.gate_up_proj.weight", "mlp.down_proj.weight"]
+                weights = []
+                for_each_to_tranpose_nz(weights, enable_weight_nz, layer, layer_idx)
+            else:
+                if layer.mlp.shared_experts is not None:
+                    if only_decode:
+                        # from models.modeling_deepseek import DeepseekV2MLP
+                        from sglang.srt.models.deepseek_v2 import DeepseekV2MLP
+                        if isinstance(layer.mlp.shared_experts, DeepseekV2MLP):
+                            weights = ["mlp.shared_experts.gate_up_proj.weight", "mlp.shared_experts.down_proj.weight"]
+                            weights = []
+                            for_each_to_tranpose_nz(weights, enable_weight_nz, layer, layer_idx)
+                        else:
+                            weights = ["mlp.shared_experts.w13_weight", "mlp.shared_experts.w2_weight"]
+                            for_each_to_tranpose_nz(weights, enable_weight_nz, layer, layer_idx)
+                    else:
+                        weights = ["mlp.shared_experts.gate_up_proj.weight", "mlp.shared_experts.down_proj.weight"]
+                        for_each_to_tranpose_nz(weights, enable_weight_nz, layer, layer_idx)
+                if layer.mlp.experts is not None:
+                    weights = ["mlp.experts.w13_weight", "mlp.experts.w2_weight"]
+                    for_each_to_tranpose_nz(weights, enable_weight_nz_bk, layer, layer_idx)
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -365,6 +442,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "torch_native"
                 ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
