@@ -18,7 +18,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, set_weight_attrs
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -29,11 +29,15 @@ import logging
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_npu = is_npu()
 
 if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
+
+if _is_npu:
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +140,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        num_experts: Optional[int] = None,
     ) -> torch.Tensor:
         return self.forward(
             x=x,
@@ -154,6 +159,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             inplace=inplace,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
+            num_experts=num_experts,
         )
 
     def forward_cuda(
@@ -242,6 +248,39 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         inplace: bool = True,
+    ) -> torch.Tensor:
+        return moe_forward_native(
+            layer,
+            x,
+            use_grouped_topk,
+            top_k,
+            router_logits,
+            renormalize,
+            topk_group,
+            num_expert_group,
+            num_fused_shared_experts,
+            custom_routing_function,
+            correction_bias,
+        )
+
+    def forward_npu(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            use_grouped_topk: bool,
+            top_k: int,
+            router_logits: torch.Tensor,
+            renormalize: bool,
+            topk_group: Optional[int] = None,
+            num_expert_group: Optional[int] = None,
+            num_fused_shared_experts: int = 0,
+            custom_routing_function: Optional[Callable] = None,
+            correction_bias: Optional[torch.Tensor] = None,
+            activation: str = "silu",
+            apply_router_weight_on_input: bool = False,
+            inplace: bool = True,
+            no_combine: bool = False,
+            routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         return moe_forward_native(
             layer,
@@ -686,6 +725,7 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             routed_scaling_factor=self.routed_scaling_factor,
+            num_experts=self.num_experts,
         )
 
         if self.reduce_results and self.tp_size > 1:
