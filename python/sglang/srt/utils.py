@@ -2094,9 +2094,10 @@ class DeepEPMode(Enum):
 
 
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
     return (
         (forward_mode is not None)
-        and not forward_mode.is_idle()
+        and not forward_mode == ForwardMode.IDLE
         and hidden_states.shape[0] > 0
     )
 
