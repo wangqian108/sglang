@@ -607,6 +607,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             * attn_factor
         )
         self.device = device
+        if _is_npu:
+            self.device = "npu"
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
