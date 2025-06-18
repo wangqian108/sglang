@@ -57,12 +57,12 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
                 )
             model_module = auto_modules["AutoModel"]
         if model_config.impl == ModelImpl.TRANSFORMERS:
-            if not model_module.is_backend_compatible():
-                raise ValueError(
-                    f"The Transformers implementation of {arch} is not "
-                    "compatible with vLLM."
-                )
-            architectures[i] = "TransformersForCausalLM"
+            # if not model_module.is_backend_compatible():
+            #     raise ValueError(
+            #         f"The Transformers implementation of {arch} is not "
+            #         "compatible with vLLM."
+            #     )
+            architectures[i] = "DeepseekForCausalLM"
         if model_config.impl == ModelImpl.AUTO:
             if not model_module.is_backend_compatible():
                 raise ValueError(
