@@ -1,149 +1,85 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/_custom_ops.py
-import logging
-from typing import List, Tuple
+from torch import nn
 
-import torch
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
-from sglang.srt.utils import get_bool_env_var, is_hip, is_hpu, is_npu
-
-logger = logging.getLogger(__name__)
-use_vllm_custom_allreduce = get_bool_env_var(
-    "USE_VLLM_CUSTOM_ALLREDUCE", default="false"
-)
-
-if not is_hpu():
-    # ROCm does not use vllm custom allreduce
-    if use_vllm_custom_allreduce and not is_hip():
-        try:
-            import vllm._C
-        except ImportError as e:
-            logger.warning("Failed to import from vllm._C with %r", e)
-    else:
-        try:
-            import sgl_kernel
-        except ImportError as e:
-            logger.warning("Failed to import from custom_ar with %r", e)
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_npu = is_npu()
 
 
-if not is_hip() and not is_npu():
-    if use_vllm_custom_allreduce:
-        custom_op = torch.ops._C_custom_ar
-    else:
-        custom_op = sgl_kernel.allreduce
+class CustomOp(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._forward_method = self.dispatch_forward()
 
-    # custom allreduce
-    def init_custom_ar(
-        ipc_tensors: List[torch.Tensor],
-        rank_data: torch.Tensor,
-        rank: int,
-        full_nvlink: bool,
-    ) -> int:
-        return custom_op.init_custom_ar(ipc_tensors, rank_data, rank, full_nvlink)
+        # States for torch.compile
+        self._original_forward_method = None
+        self.is_torch_compile = False
 
-    def all_reduce(
-        fa: int,
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        reg_buffer: int,
-        reg_buffer_sz_bytes: int,
-    ) -> None:
-        custom_op.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
+    def enter_torch_compile(self, num_tokens: int):
+        # Skip if Op is already entered compile mode.
+        # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
+        # among layers and `enter_torch_compile` will be called many times.
+        # We should prevent `self._original_forward_method` from being overridden when
+        # it is not the first time `enter_torch_compile` called.
+        if self.is_torch_compile:
+            return
 
-    def dispose(fa: int) -> None:
-        custom_op.dispose(fa)
+        self._original_forward_method = self._forward_method
+        # NOTE: Temporarily workaround MoE
+        if "FusedMoE" in self.__class__.__name__:
+            if num_tokens == 1:
+                from sglang.srt.layers.moe.fused_moe_native import (
+                    fused_moe_forward_native,
+                )
 
-    def meta_size() -> int:
-        return custom_op.meta_size()
+                # The performance of torch.compile on this layer is not always good when bs > 1,
+                # so we decide to only use torch.compile when bs =1
+                self._forward_method = fused_moe_forward_native
+        else:
+            self._forward_method = self.forward_native
+        self.is_torch_compile = True
 
-    def register_buffer(fa: int, ipc_tensors: List[int]) -> None:
-        return custom_op.register_buffer(fa, ipc_tensors)
+    def leave_torch_compile(self):
+        # Skip if Op is already exited compile mode.
+        if not self.is_torch_compile:
+            return
 
-    def get_graph_buffer_ipc_meta(fa: int) -> Tuple[List[int], List[int]]:
-        return custom_op.get_graph_buffer_ipc_meta(fa)
+        self._forward_method = self._original_forward_method
+        self._original_forward_method = None
+        self.is_torch_compile = False
 
-    def register_graph_buffers(
-        fa: int, handles: List[List[int]], offsets: List[List[int]]
-    ) -> None:
-        custom_op.register_graph_buffers(fa, handles, offsets)
+    # Please do not override this method, because `self._forward_method` can change when in torch compile mode
+    def forward(self, *args, **kwargs):
+        return self._forward_method(*args, **kwargs)
 
-else:
-    # ROCM custom allreduce
+    def forward_native(self, *args, **kwargs):
+        raise NotImplementedError
 
-    def init_custom_ar(
-        meta: torch.Tensor,
-        rank_data: torch.Tensor,
-        handles: List[str],
-        offsets: List[int],
-        rank: int,
-        full_nvlink: bool,
-    ) -> int:
-        return sgl_kernel.allreduce.init_custom_ar(
-            meta, rank_data, handles, offsets, rank, full_nvlink
-        )
+    def forward_cuda(self, *args, **kwargs):
+        raise NotImplementedError
 
-    def all_reduce_reg(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
-        sgl_kernel.allreduce.all_reduce_reg(fa, inp, out)
+    def forward_npu(self, *args, **kwargs):
+        raise NotImplementedError
 
-    def all_reduce_unreg(
-        fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
-    ) -> None:
-        sgl_kernel.allreduce.all_reduce_unreg(fa, inp, reg_buffer, out)
+    def forward_hip(self, *args, **kwargs):
+        return self.forward_cuda(*args, **kwargs)
 
-    def dispose(fa: int) -> None:
-        sgl_kernel.allreduce.dispose(fa)
+    def forward_xpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
 
-    def meta_size() -> int:
-        return sgl_kernel.allreduce.meta_size()
+    def forward_hpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
 
-    def register_buffer(
-        fa: int, t: torch.Tensor, handles: List[str], offsets: List[int]
-    ) -> None:
-        return sgl_kernel.allreduce.register_buffer(fa, t, handles, offsets)
+    def forward_cpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
 
-    def get_graph_buffer_ipc_meta(fa: int) -> Tuple[torch.Tensor, List[int]]:
-        return sgl_kernel.allreduce.get_graph_buffer_ipc_meta(fa)
-
-    def register_graph_buffers(
-        fa: int, handles: List[str], offsets: List[List[int]]
-    ) -> None:
-        sgl_kernel.allreduce.register_graph_buffers(fa, handles, offsets)
-
-    def allocate_meta_buffer(size: int) -> torch.Tensor:
-        return sgl_kernel.allreduce.allocate_meta_buffer(size)
-
-    def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
-        return sgl_kernel.allreduce.get_meta_buffer_ipc_handle(inp)
-
-
-def mscclpp_generate_unique_id() -> bytes:
-    return sgl_kernel.allreduce.mscclpp_generate_unique_id()
-
-
-def mscclpp_init_context(
-    unique_id: bytes,
-    rank: int,
-    world_size: int,
-    scratch: torch.Tensor,
-    put_buffer: torch.Tensor,
-    nranks_per_node: int,
-    rank_to_node: List[int],
-    rank_to_ib: List[int],
-    context_selection: int,
-) -> int:
-    return sgl_kernel.allreduce.mscclpp_init_context(
-        unique_id,
-        rank,
-        world_size,
-        scratch,
-        put_buffer,
-        nranks_per_node,
-        rank_to_node,
-        rank_to_ib,
-        context_selection,
-    )
-
-
-def mscclpp_allreduce(
-    context: int, inp: torch.Tensor, out: torch.Tensor, nthreads: int, nblocks: int
-) -> None:
-    return sgl_kernel.allreduce.mscclpp_allreduce(context, inp, out, nthreads, nblocks)
+    def dispatch_forward(self):
+        if _is_cuda:
+            return self.forward_cuda
+        elif _is_hip:
+            return self.forward_hip
+        elif _is_npu:
+            return self.forward_npu
+        else:
+            return self.forward_native
