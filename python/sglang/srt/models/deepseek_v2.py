@@ -107,7 +107,7 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
-_is_npu = is_npu()
+_is_npu = True
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -385,14 +385,9 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         forward_mode = forward_batch.forward_mode
         shared_output = None
-        log_info_on_rank0(logger, f"forward_mode is {forward_mode.name}")
         if is_non_idle_and_non_empty(forward_mode, hidden_states):
-            # router_logits: (num_tokens, n_experts)
-            log_info_on_rank0(logger, f"gate begin")
             router_logits = self.gate(hidden_states)
-            log_info_on_rank0(logger, f"gate end, _forward_shared_experts begin")
             shared_output = self._forward_shared_experts(hidden_states)
-            log_info_on_rank0(logger, f"_forward_shared_experts end, select_experts begin")
             topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -413,7 +408,6 @@ class DeepseekV2MoE(nn.Module):
                          n_routed_experts=self.n_routed_experts)
                 ),
             )
-            log_info_on_rank0(logger, f"topk_idx is {topk_idx.shape}")
         else:
             topk_idx = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
@@ -441,14 +435,7 @@ class DeepseekV2MoE(nn.Module):
                     topk_weights=topk_weights,
                     forward_mode=forward_mode,
                 )
-                log_info_on_rank0(logger, f"output length is {len(output)}")
                 hidden_states, dynamic_scale, topk_idx, expert_token_nums, ep_recv_counts, tp_recv_counts = output[:6]
-                # logger.info(f"hidden_states is {hidden_states}")
-                # logger.info(f"dynamic_scale is {dynamic_scale}")
-                # logger.info(f"topk_idx is {topk_idx}")
-                # logger.info(f"expert_token_nums is {expert_token_nums}")
-                # logger.info(f"ep_recv_counts is {ep_recv_counts}")
-                # logger.info(f"tp_recv_counts is {tp_recv_counts}")
             else:
                 (
                     hidden_states,
@@ -465,8 +452,6 @@ class DeepseekV2MoE(nn.Module):
                     topk_weights=topk_weights,
                     forward_mode=forward_mode,
                 )
-        log_info_on_rank0(logger, "self.deepep_dispatcher.dispatch running successfully!")
-        # logger.info(f"expert_token_nums is {expert_token_nums}")
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
@@ -485,7 +470,6 @@ class DeepseekV2MoE(nn.Module):
                      ) if _is_npu else {}
             )
         )
-        log_info_on_rank0(logger, "self.experts running successfully!")
         if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
                 hidden_states=final_hidden_states,
@@ -1578,7 +1562,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         #     hidden_states, residual, forward_batch
         # )
         hidden_states = self.mlp(hidden_states, forward_batch)
-        log_info_on_rank0(logger, f"decode forward finished.. hidden_states shape is {hidden_states.shape}")
         # hidden_states, residual = self.layer_communicator.postprocess_layer(
         #     hidden_states, residual, forward_batch
         # )
@@ -1727,7 +1710,6 @@ class DeepseekV2Model(nn.Module):
             if forward_batch.can_run_tbo
             else total_num_layers
         )
-        log_info_on_rank0(logger, f"normal_num_layers is {normal_num_layers}, total_num_layers is {total_num_layers}")
         for i in range(normal_num_layers):
             # TODO torch dynamo error:torch._dynamo.exc.Unsupported: 'inline in skipfiles: ExpertDistributionRecorder.with_current_layer | helper /data/anaconda/envs/wangq_py310_pt25/lib/python3.10/contextlib.py, skipped according trace_rules.lookup SKIP_DIRS'
             # with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -1735,7 +1717,6 @@ class DeepseekV2Model(nn.Module):
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual, zero_allocator
             )
-            log_info_on_rank0(logger, f"layer {i} running finished..")
         if normal_num_layers != total_num_layers:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers[normal_num_layers:],
