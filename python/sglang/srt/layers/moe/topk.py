@@ -155,7 +155,6 @@ def npu_topk(
     return topk_weight, topk_ids
 
 # This is used by the Deepseek V2/V3/R1 series models
-# @torch.compile(dynamic=True, backend=get_compiler_backend())
 def grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -169,20 +168,17 @@ def grouped_topk(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-    log_info_on_rank0(logger, f"grouped_topk part 1 begin")
     scores = torch.softmax(gating_output, dim=-1)
     if _is_npu:
         scores = scores.to(torch.float32)
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
-    log_info_on_rank0(logger, f"grouped_topk part 2 begin")
     group_scores = (
         scores.view(num_token, num_expert_group, -1).max(dim=-1).values
     )  # [n, n_group]
     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
         1
     ]  # [n, top_k_group]
-    log_info_on_rank0(logger, f"grouped_topk part 3 begin")
     group_mask = torch.zeros_like(group_scores)  # [n, n_group]
     group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
     score_mask = (
@@ -190,10 +186,8 @@ def grouped_topk(
         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
         .reshape(num_token, -1)
     )  # [n, e]
-    log_info_on_rank0(logger, f"grouped_topk part 4 begin")
     tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
     topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
-    log_info_on_rank0(logger, f"grouped_topk part 5 begin")
     if num_fused_shared_experts:
         topk_ids[:, -1] = torch.randint(
             low=num_experts,
@@ -203,7 +197,6 @@ def grouped_topk(
             device=topk_ids.device,
         )
         topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-    log_info_on_rank0(logger, f"grouped_topk part 6 begin")
 
     if renormalize:
         topk_weights_sum = (
@@ -213,7 +206,6 @@ def grouped_topk(
         )
         topk_weights = topk_weights / topk_weights_sum
 
-    log_info_on_rank0(logger, f"grouped_topk part 7 begin")
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
@@ -395,13 +387,10 @@ def select_experts(
             info=expert_location_dispatch_info,
         )
     )
-    log_info_on_rank0(logger, f"transform_select_experts_inputs end")
-    # DeepSeek V2/V3/R1 series models use grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
-            log_info_on_rank0(logger, f"correction_bias is None , grouped_topk start")
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -414,9 +403,7 @@ def select_experts(
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
-            log_info_on_rank0(logger, f"correction_bias is None , grouped_topk end")
         else:
-            log_info_on_rank0(logger, f"correction_bias is not None , grouped_topk start")
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -430,7 +417,6 @@ def select_experts(
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
-            log_info_on_rank0(logger, f"correction_bias is not None , grouped_topk end")
     elif torch_native and custom_routing_function is None:
         assert (
             num_token_non_padded is None
@@ -470,7 +456,5 @@ def select_experts(
             n_routed_experts=n_routed_experts,
             global_rank=get_tensor_model_parallel_rank(),
         )
-    log_info_on_rank0(logger, f"get_global_expert_distribution_recorder begin")
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-    log_info_on_rank0(logger, f"get_global_expert_distribution_recorder end")
     return topk_weights, topk_ids
