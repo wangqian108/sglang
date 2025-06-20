@@ -48,6 +48,7 @@ from sglang.srt.utils import (
     dispose_tensor,
     get_bool_env_var,
     is_hip,
+    is_npu,
     set_weight_attrs,
     log_info_on_rank0,
 )
@@ -105,6 +106,7 @@ class GroupedGemmRunner(CustomOp):
         scale_b: torch.Tensor = None,
         block_shape: Optional[List[int]] = None,
         c_dtype=None,
+        **kwargs
     ):
         if self.use_flashinfer:
             # TODO: flashinfer
@@ -155,8 +157,6 @@ class GroupedGemmRunner(CustomOp):
             avg_tokens_per_expert=None,
             n_routed_experts_per_rank=None
     ):
-        log_info_on_rank0(logger, f"n_routed_experts_per_rank is {n_routed_experts_per_rank}")
-        # logger.info(f"expert_tokens is {expert_tokens}")
         world_size = get_tensor_model_parallel_world_size()
         if world_size > 1 and n_routed_experts_per_rank >= 1:
             mm1_mm3 = torch_npu.npu_grouped_matmul([a], [b],
@@ -164,17 +164,12 @@ class GroupedGemmRunner(CustomOp):
                                                    split_item=3,
                                                    output_dtype=torch.bfloat16,
                                                    group_type=0,
-                                                   # group_list_type=1, #(2 if self.enable_low_latency else 1),
-                                                   # tuning_config=avg_tokens_per_expert
                                                    )[0]
         else:
             mm1_mm3 = torch.matmul(a, b)
-
-        # TODO 1p case cannot run successfully using npu_grouped_matmul
-        # mm1_mm3 = torch.matmul(a, b)
         return mm1_mm3
 
-    forward_native = forward_cuda
+    forward_native = forward_cuda if not _is_npu else forward_npu
 
 class EPMoE(torch.nn.Module):
     """
@@ -1380,6 +1375,7 @@ class NpuDeepEPMoE(DeepEPMoE):
             custom_routing_function=custom_routing_function,
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
+            deepep_mode=deepep_mode,
         )
         self.deepep_mode = deepep_mode
         self.w13_weight_fp8 = (
@@ -1431,7 +1427,6 @@ class NpuDeepEPMoE(DeepEPMoE):
             dtype=torch.int64,
         )
 
-        # log_info_on_rank0(logger, "self.grouped_gemm_runner-0 running start!")
         # GroupGemm-0
         gateup_output = self.grouped_gemm_runner(
             a=hidden_states,
@@ -1454,7 +1449,6 @@ class NpuDeepEPMoE(DeepEPMoE):
             expert_tokens=expert_tokens
         )
 
-        log_info_on_rank0(logger, "self.grouped_gemm_runner-0 running successfully!")
         if self.w2_input_scale is None and not self.use_block_quant:
             self.w2_input_scale = torch.ones(
                 self.num_experts_per_partition,
@@ -1489,7 +1483,6 @@ class NpuDeepEPMoE(DeepEPMoE):
             n_routed_experts_per_rank=n_routed_experts_per_rank,
             expert_tokens=expert_tokens
         )
-        log_info_on_rank0(logger, "self.grouped_gemm_runner-1 running successfully!")
         return down_output
 
 
