@@ -53,7 +53,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import select_experts, npu_topk
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -101,12 +101,14 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -231,6 +233,7 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        self.n_routed_experts = config.n_routed_experts
         self.num_fused_shared_experts = (
             0
             if global_server_args_dict["disable_shared_experts_fusion"]
@@ -270,6 +273,7 @@ class DeepseekV2MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
+            n_routed_experts_per_rank=self.n_routed_experts // self.tp_size,
             **(
                 dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
                 if global_server_args_dict["enable_deepep_moe"]
@@ -295,6 +299,19 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self.top_k = config.num_experts_per_tok
+
+        if _is_npu:
+            self.custom_routing_function = npu_topk
+            self.use_grouped_topk = False if config.n_routed_experts == 256 else True
+            self.dispatch_args = {
+                "n_shared_experts": config.n_shared_experts,
+                "n_routed_experts": config.n_routed_experts,
+                "num_experts_per_tok": config.num_experts_per_tok,
+            }
+        else:
+            self.custom_routing_function = None
+            self.use_grouped_topk = True
+            self.dispatch_args = None
 
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
@@ -323,6 +340,7 @@ class DeepseekV2MoE(nn.Module):
                 deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
                 async_finish=True,
                 return_recv_hook=True,
+                **self.dispatch_args,
             )
 
         self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
@@ -370,7 +388,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 top_k=self.top_k,
-                use_grouped_topk=True,
+                use_grouped_topk=self.use_grouped_topk,
                 renormalize=self.renormalize,
                 topk_group=self.topk_group,
                 num_expert_group=self.num_expert_group,
@@ -381,6 +399,10 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
+                **(
+                    dict(custom_routing_function=self.custom_routing_function,
+                         n_routed_experts=self.n_routed_experts)
+                ),
             )
         else:
             topk_idx = torch.full(
@@ -389,23 +411,47 @@ class DeepseekV2MoE(nn.Module):
             topk_weights = torch.empty(
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
+        reorder_topk_ids = None
+        num_recv_tokens_per_expert = None
+        seg_indptr = None
+        masked_m = None
+        expected_m = None
+        expert_token_nums = None
+        ep_recv_counts = None
+        dynamic_scale = None
         if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
-            (
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                reorder_topk_ids,
-                num_recv_tokens_per_expert,
-                seg_indptr,
-                masked_m,
-                expected_m,
-            ) = self.deepep_dispatcher.dispatch(
-                hidden_states=hidden_states,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights,
-                forward_mode=forward_mode,
-            )
+            if _is_npu:
+                topk_ids = topk_idx
+                (
+                    hidden_states,
+                    dynamic_scale,
+                    topk_idx,
+                    expert_token_nums,
+                    ep_recv_counts,
+                    tp_recv_counts
+                ) = self.deepep_dispatcher.dispatch(
+                    hidden_states=hidden_states,
+                    topk_idx=topk_idx,
+                    topk_weights=topk_weights,
+                    forward_mode=forward_mode,
+                )
+            else:
+                (
+                    hidden_states,
+                    topk_idx,
+                    topk_weights,
+                    reorder_topk_ids,
+                    num_recv_tokens_per_expert,
+                    seg_indptr,
+                    masked_m,
+                    expected_m,
+                ) = self.deepep_dispatcher.dispatch(
+                    hidden_states=hidden_states,
+                    topk_idx=topk_idx,
+                    topk_weights=topk_weights,
+                    forward_mode=forward_mode,
+                )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
@@ -416,6 +462,12 @@ class DeepseekV2MoE(nn.Module):
             expected_m=expected_m,
             num_recv_tokens_per_expert=num_recv_tokens_per_expert,
             forward_mode=forward_mode,
+            **(
+                dict(batch_size=forward_batch.batch_size,
+                     expert_tokens=expert_token_nums,
+                     dynamic_scale=dynamic_scale,
+                     ) if _is_npu else {}
+            )
         )
         if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
@@ -423,6 +475,12 @@ class DeepseekV2MoE(nn.Module):
                 topk_idx=topk_idx,
                 topk_weights=topk_weights,
                 forward_mode=forward_mode,
+                **(
+                    dict(topk_ids=topk_ids,
+                         ep_send_counts=ep_recv_counts,
+                         tp_send_counts=tp_recv_counts,
+                         ) if _is_npu else {}
+                )
             )
 
         if shared_output is not None:
@@ -797,7 +855,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
-                # and sum(forward_batch.extend_prefix_lens_cpu) == 0
+                and sum(forward_batch.extend_prefix_lens_cpu) == 0
             ):
                 return AttnForwardMethod.MHA
             else:
@@ -1499,7 +1557,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        pad_size = None
+        if hidden_states.size(0) == 0 or hidden_states.size(0) % get_attention_tp_size()!= 0:
+            pad_size = get_attention_tp_size() - (hidden_states.size(0) % get_attention_tp_size())
+            hidden_states = torch.nn.functional.pad(hidden_states, [0, 0, 0, pad_size], "constant", 0)
+
         hidden_states = self.mlp(hidden_states, forward_batch)
+
+        if pad_size is not None:
+            hidden_states = hidden_states[:-pad_size, :]
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
