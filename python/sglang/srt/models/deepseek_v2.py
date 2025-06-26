@@ -53,7 +53,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import select_experts, npu_topk
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -101,12 +101,14 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -231,6 +233,7 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        self.n_routed_experts = config.n_routed_experts
         self.num_fused_shared_experts = (
             0
             if global_server_args_dict["disable_shared_experts_fusion"]
@@ -270,6 +273,7 @@ class DeepseekV2MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
+            n_routed_experts_per_rank=self.n_routed_experts // self.tp_size,
             **(
                 dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
                 if global_server_args_dict["enable_deepep_moe"]
@@ -295,6 +299,15 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self.top_k = config.num_experts_per_tok
+
+        if _is_npu:
+            self.dispatch_args = {
+                "n_shared_experts": config.n_shared_experts,
+                "n_routed_experts": config.n_routed_experts,
+                "num_experts_per_tok": config.num_experts_per_tok,
+            }
+        else:
+            self.dispatch_args = {}
 
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
@@ -323,6 +336,7 @@ class DeepseekV2MoE(nn.Module):
                 deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
                 async_finish=True,
                 return_recv_hook=True,
+                **self.dispatch_args,
             )
 
         self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
@@ -340,6 +354,8 @@ class DeepseekV2MoE(nn.Module):
         if not self._enable_deepep_moe:
             return self.forward_normal(hidden_states)
         else:
+            if _is_npu:
+                return self.forward_deepep_npu(hidden_states, forward_batch)
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -434,6 +450,100 @@ class DeepseekV2MoE(nn.Module):
 
         return final_hidden_states
 
+    def forward_deepep_npu(
+            self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        # need padding for MC2 dispatch
+        pad_size = None
+        if hidden_states.size(0) == 0 or hidden_states.size(0) % get_attention_tp_size() != 0:
+            pad_size = get_attention_tp_size() - (hidden_states.size(0) % get_attention_tp_size())
+            hidden_states = torch.nn.functional.pad(hidden_states, [0, 0, 0, pad_size], "constant", 0)
+        forward_mode = forward_batch.forward_mode
+        shared_output = None
+        if is_non_idle_and_non_empty(forward_mode, hidden_states):
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
+            topk_weights, topk_idx = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                use_grouped_topk=False if self.n_routed_experts == 256 else True,
+                renormalize=self.renormalize,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                correction_bias=self.correction_bias,
+                routed_scaling_factor=self.routed_scaling_factor,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+                custom_routing_function=npu_topk,
+                n_routed_experts=self.n_routed_experts
+            )
+        else:
+            topk_idx = torch.full(
+                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            )
+            topk_weights = torch.empty(
+                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+            )
+        dynamic_scale = None
+        expert_token_nums = None
+        if self.ep_size > 1:
+            topk_ids = topk_idx
+            (
+                hidden_states,
+                dynamic_scale,
+                topk_idx,
+                expert_token_nums,
+                ep_recv_counts,
+                tp_recv_counts
+            ) = self.deepep_dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                forward_mode=forward_mode,
+            )
+
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            reorder_topk_ids=None,
+            seg_indptr=None,
+            masked_m=None,
+            expected_m=None,
+            num_recv_tokens_per_expert=None,
+            forward_mode=forward_mode,
+            batch_size=forward_batch.batch_size,
+            expert_tokens=expert_token_nums,
+            dynamic_scale=dynamic_scale,
+        )
+        if self.ep_size > 1:
+            final_hidden_states = self.deepep_dispatcher.combine(
+                hidden_states=final_hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                forward_mode=forward_mode,
+                topk_ids=topk_ids,
+                ep_send_counts=ep_recv_counts,
+                tp_send_counts=tp_recv_counts,
+            )
+
+        if shared_output is not None:
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            final_hidden_states *= self.routed_scaling_factor
+
+        if pad_size is not None:
+            final_hidden_states = final_hidden_states[:-pad_size, :]
+
+        return final_hidden_states
+
     def _forward_shared_experts(self, hidden_states):
         if self.num_fused_shared_experts == 0:
             return self.shared_experts(hidden_states)
@@ -442,7 +552,7 @@ class DeepseekV2MoE(nn.Module):
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+                state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):
             # router_logits: (num_tokens, n_experts)
             state.router_logits = self.gate(state.hidden_states_mlp_input)
@@ -452,7 +562,7 @@ class DeepseekV2MoE(nn.Module):
     def op_shared_experts(self, state):
         hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
         if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, hidden_states_mlp_input
+                state.forward_batch.forward_mode, hidden_states_mlp_input
         ):
             state.shared_output = self.shared_experts(hidden_states_mlp_input)
         else:
@@ -464,7 +574,7 @@ class DeepseekV2MoE(nn.Module):
 
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
+                    self.layer_id
             ):
                 state.topk_weights_local, state.topk_idx_local = select_experts(
                     hidden_states=hidden_states,
@@ -504,7 +614,7 @@ class DeepseekV2MoE(nn.Module):
     def op_dispatch_b(self, state):
         if self.ep_size > 1:
             with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
+                    self.layer_id
             ):
                 (
                     state.hidden_states_experts_input,
@@ -797,7 +907,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
-                # and sum(forward_batch.extend_prefix_lens_cpu) == 0
+                and sum(forward_batch.extend_prefix_lens_cpu) == 0
             ):
                 return AttnForwardMethod.MHA
             else:
@@ -1499,7 +1609,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        pad_size = None
+        if hidden_states.size(0) == 0 or hidden_states.size(0) % get_attention_tp_size()!= 0:
+            pad_size = get_attention_tp_size() - (hidden_states.size(0) % get_attention_tp_size())
+            hidden_states = torch.nn.functional.pad(hidden_states, [0, 0, 0, pad_size], "constant", 0)
+
         hidden_states = self.mlp(hidden_states, forward_batch)
+
+        if pad_size is not None:
+            hidden_states = hidden_states[:-pad_size, :]
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
