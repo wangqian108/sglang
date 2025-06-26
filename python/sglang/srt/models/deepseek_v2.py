@@ -103,7 +103,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_non_idle_and_non_empty,
-    log_info_on_rank0,
+    log_info_on_rank0, get_compiler_backend,
 )
 
 _is_hip = is_hip()
@@ -273,7 +273,6 @@ class DeepseekV2MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
-            n_routed_experts_per_rank=self.n_routed_experts // self.tp_size,
             **(
                 dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
                 if global_server_args_dict["enable_deepep_moe"]
@@ -490,13 +489,16 @@ class DeepseekV2MoE(nn.Module):
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
 
+        expert_tokens = None
+        dynamic_scale = None
+
         if self.ep_size > 1:
             topk_ids = topk_idx
             (
                 hidden_states,
                 dynamic_scale,
                 topk_idx,
-                expert_token_nums,
+                expert_tokens,
                 ep_recv_counts,
                 tp_recv_counts
             ) = self.deepep_dispatcher.dispatch(
@@ -508,16 +510,7 @@ class DeepseekV2MoE(nn.Module):
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            reorder_topk_ids=None,
-            seg_indptr=None,
-            masked_m=None,
-            expected_m=None,
-            num_recv_tokens_per_expert=None,
-            forward_mode=forward_mode,
-            batch_size=forward_batch.batch_size,
-            expert_tokens=expert_token_nums,
+            expert_tokens=expert_tokens,
             dynamic_scale=dynamic_scale,
         )
         if self.ep_size > 1:
@@ -965,8 +958,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
-        # log_info_on_rank0(logger, f"hidden_states shape is {hidden_states.shape}, "
-        #                           f"attn_forward_method is {attn_forward_method}, forward_batch is {forward_batch},")
 
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
@@ -1617,17 +1608,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        
-        # pad_size = None
-        # if hidden_states.size(0) == 0 or hidden_states.size(0) % get_attention_tp_size() != 0:
-        #     pad_size = get_attention_tp_size() - (hidden_states.size(0) % get_attention_tp_size())
-        #     hidden_states = torch.nn.functional.pad(hidden_states, [0, 0, 0, pad_size], "constant", 0)
 
         hidden_states = self.mlp(hidden_states, forward_batch)
 
-        # if pad_size is not None:
-        #     hidden_states = hidden_states[:-pad_size, :]
-        
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
