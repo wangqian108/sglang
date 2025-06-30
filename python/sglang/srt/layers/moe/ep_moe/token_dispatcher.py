@@ -7,7 +7,14 @@ from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import DeepEPMode, get_int_env_var, load_json_config, is_npu
+from sglang.srt.utils import (
+    DeepEPMode,
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+    is_npu,
+    load_json_config,
+)
 
 _is_npu = is_npu()
 
@@ -37,6 +44,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_run_moe_deep_preprocess,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -382,6 +391,15 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
         https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py
         """
+        if _use_aiter:
+            # skip permutation here as aiter fused_moe has fused inside
+            reorder_topk_ids = torch.empty(
+                (0,), device=hidden_states.device, dtype=torch.int64
+            )
+            seg_indptr = torch.zeros(
+                (self.num_experts + 1,), device=hidden_states.device, dtype=torch.int64
+            )
+            return reorder_topk_ids, seg_indptr, hidden_states
 
         reorder_topk_ids, self.src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
             topk_idx, self.num_experts
@@ -415,7 +433,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
             output = hidden_states
         else:
             if hidden_states.shape[0] > 0:
@@ -768,12 +786,53 @@ class NpuDeepEPDispatcher:
                        dtype=torch.float32) * (1 - epsilon) + epsilon
         )
 
-    def dispatch(self, *args, **kwargs) -> Tuple:
-        x = kwargs.get("hidden_states")
-        hidden_states = x.view(-1, x.shape[-1])
-        topk_ids = kwargs.get("topk_idx")
-        topk_ids = topk_ids.to(torch.int)
+    def dispatch(self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_mode: ForwardMode
+    ) -> Tuple:
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        topk_ids = topk_idx.to(torch.int)
+        if forward_mode.is_extend():
+            return self.dispatch_prefill(hidden_states, topk_ids)
+        else:
+            return self.dispatch_decode(hidden_states, topk_ids)
 
+    def dispatch_prefill(self, hidden_states, topk_ids) -> Tuple:
+        expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
+            hidden_states,
+            expert_idx=topk_ids,
+            active_num=topk_ids.shape[0] * topk_ids.shape[1],
+            scale=self.experts_scale,  # None: non-quant; tensor with shape [num_rows,]: quant
+            expert_num=self.num_experts,
+            expert_tokens_num_type=1,  # 0: cumsum mode(not supported now); 1: count mode
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, self.num_experts],
+            quant_mode=1  # -1: non-quant; 1: dyanmic quant; 0: static quant(not supported now)
+        )
+        tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
+        dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=self.group)
+        # combine tensors, do reduceSum and D2H togather
+        combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
+        # view: EP, E // EP
+        combine_tokens = combine_tokens.view(2, self.world_size, -1).sum(2)
+        all_tokens = combine_tokens[0].sum()
+        combine_tokens_cpu = combine_tokens.cpu().tolist()
+        input_splits = combine_tokens_cpu[1]
+        output_splits = combine_tokens_cpu[0]
+        gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
+        dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=self.group)
+        gathered_pertoken_scale = None
+
+        # reroute
+        hidden_states_ordered_by_experts, gathered_pertoken_scale, gathered_idxs_unsort, expert_tokens = \
+            torch_npu.npu_moe_re_routing(gathered_tokens, tokens_per_expert_group.view(self.world_size, -1),
+                                         per_token_scales=gathered_pertoken_scale)
+        expert_tokens = expert_tokens.to(torch.int64)
+        return hidden_states_ordered_by_experts, gathered_pertoken_scale, gathered_idxs_unsort, expert_tokens, input_splits, output_splits, expanded_x, expanded_row_idx
+
+    def dispatch_decode(self, hidden_states, topk_ids) -> Tuple:
         _kwargs = {
             "x": hidden_states,
             "expert_ids": topk_ids,
@@ -786,22 +845,68 @@ class NpuDeepEPDispatcher:
             "group_ep": self.group_name,
             "ep_world_size": self.world_size,
             "ep_rank_id": self.global_rank,
+            "group_tp": self.group_name,
+            "tp_world_size": self.experts_tp_size,
         }
-        return torch_npu.npu_moe_distribute_dispatch(**_kwargs)[:6]
+        (
+            hidden_states,
+            dynamic_scale,
+            topk_idx,
+            expert_tokens,
+            ep_recv_counts,
+            tp_recv_counts,
+        ) = torch_npu.npu_moe_distribute_dispatch(**_kwargs)[:6]
+        return hidden_states, dynamic_scale, topk_idx, expert_tokens, ep_recv_counts, tp_recv_counts, None, None
 
-    def combine(self, *args, **kwargs) -> Tuple:
-        x = kwargs.get("hidden_states")
-        topk_ids = kwargs.get("topk_ids")
-        expand_idx = kwargs.get("topk_idx")
-        topk_weights = kwargs.get("topk_weights")
-        ep_send_counts = kwargs.get("ep_send_counts")
-        tp_send_counts = kwargs.get("tp_send_counts")
+
+    def combine(self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_mode: ForwardMode,
+        topk_ids: torch.Tensor,
+        shared_output: torch.Tensor,
+        ep_send_counts,
+        tp_send_counts,
+        expanded_x,
+        expanded_row_idx
+    ) -> Tuple:
+        if forward_mode.is_extend():
+            input_splits = ep_send_counts
+            output_splits = tp_send_counts
+            return self.combine_prefill(hidden_states, topk_ids, topk_idx, topk_weights, input_splits, output_splits, shared_output, expanded_x, expanded_row_idx)
+        else:
+            return self.combine_decode(hidden_states, topk_ids, topk_idx, topk_weights, ep_send_counts, tp_send_counts, shared_output)
+
+
+    def combine_prefill(self, hidden_states, topk_ids, topk_idx, topk_weights, input_splits, output_splits, shared_output, expanded_x, expanded_row_idx) -> Tuple:
+        # finalize-rerouting
+        new_x = torch.index_select(hidden_states, 0, topk_idx.float().argsort().int())
+        gathered_tokens = new_x.new_empty(*expanded_x.shape)
+        dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits, group=self.group)
+
+        # finalize-routing
+        hidden_states = torch_npu.npu_moe_finalize_routing(
+            gathered_tokens,
+            skip1=shared_output,
+            skip2=None,
+            bias=None,
+            scales=topk_weights.to(gathered_tokens.dtype),
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=None,
+            drop_pad_mode=2
+        )
+        return hidden_states
+
+
+    def combine_decode(self, hidden_states, topk_ids, topk_idx, topk_weights, ep_send_counts, tp_send_counts, shared_output) -> Tuple:
         _kwargs = {
-            "expand_x": x,
+            "expand_x": hidden_states,
             "expert_ids": topk_ids.to(torch.int),
-            "expand_idx": expand_idx,
+            "expand_idx": topk_idx,
             "expert_scales": topk_weights.to(torch.float32),
             "expert_shard_type": 0,
+            "shared_expert_x": shared_output,
             "shared_expert_rank_num": self.shared_expert_rank_num,
             "moe_expert_num": self.num_experts,
             "global_bs": 0,
@@ -810,6 +915,8 @@ class NpuDeepEPDispatcher:
             "ep_world_size": self.world_size,
             "ep_rank_id": self.global_rank,
             "tp_send_counts": tp_send_counts,
+            "group_tp": self.group_name,
+            "tp_world_size": self.experts_tp_size,
         }
-        hidden_states = torch_npu.npu_moe_distribute_combine(*args, **_kwargs)
+        hidden_states = torch_npu.npu_moe_distribute_combine(**_kwargs)
         return hidden_states
